@@ -39,6 +39,7 @@ target_link_libraries(pt_blinky
     hardware_clocks
     hardware_vreg
     hardware_clocks
+    hardware_adc
     )
 
 # if (PICO_CYW43_SUPPORTED)
