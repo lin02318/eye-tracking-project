@@ -20,6 +20,7 @@
 #include "pico/stdlib.h"
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 #include <pico/multicore.h>
 #include "stdlib.h"
 
@@ -36,6 +37,9 @@
 const float conversion_factor = 3.3f / (1 << 12);   // 12 bit ADC
 uint16_t result0, result1;   // ADC read results
 float voltage_difference ;
+float Sin_P;
+float Cos_P;
+float angle;
 
 // ==================================================
 // === toggle25 thread 
@@ -65,8 +69,14 @@ static PT_THREAD (protothread_toggle25(struct pt *pt))
       adc_select_input(1); // Select ADC input 1 (GPIO27)
       result1 = adc_read();
       voltage_difference = (result1 - result0) * conversion_factor;
-      printf("Raw value 0: 0x%03x, voltage: %f V -- Raw value 1: 0x%03x, voltage: %f V -- Voltage difference: %f V\n",
-              result0, result0 * conversion_factor, result1, result1 * conversion_factor, voltage_difference);
+      printf("Sin P: %f V -- Cos P: %f V\n",
+              result0 * conversion_factor, result1 * conversion_factor);
+
+      // Calculate angle
+      Sin_P = result0 * conversion_factor - 1.65f;
+      Cos_P = result1 * conversion_factor - 1.65f;
+      angle = atan2f(Sin_P, Cos_P) * (180.0f / 3.14159265f);
+      printf("Angle: %f degrees\n", angle);
 
       PT_YIELD_usec(100000) ;
       // NEVER exit WHILE in a thread
