@@ -1,190 +1,260 @@
 /*
- Protothreads 1.4 demo code modified for TMAG6180-Q1 Angle Sensor
- Based on datasheet: SLYS037A - Revised March 2024
- 
- Core 0:
- -- blinky thread: heartbeat to show system is running
- -- angle thread: reads ADC/GPIO, computes 360 degree angle
- -- serial thread: prints the calculated angle
+ Protothreads demo for:
+ 1. TMAG6180-Q1 Angle Sensor (ADC/GPIO) - Datasheet SLYS037A
+ 2. TMAG5170 3D Hall Sensor (SPI) - Datasheet SBASAF4
 */
 
 #include "hardware/gpio.h"
-#include "hardware/timer.h"
-#include "hardware/adc.h" // Added for Analog Reading
+#include "hardware/adc.h"
+#include "hardware/spi.h" // Added for TMAG5170
 #include "pico/stdlib.h"
 #include <stdio.h>
-#include <string.h>
-#include <math.h>         // Added for atan2f
-#include <pico/multicore.h>
-#include "stdlib.h"
-
-// ==========================================
-// === protothreads globals
-// ==========================================
+#include <math.h>
 #include "pt_cornell_rp2040_v1_4.h"
 
+// ==========================================
+// === Pin Definitions
+// ==========================================
 #define LED_PIN 25
 
-// Sensor Pin Definitions
+// TMAG6180-Q1 Pins (Angle Sensor)
 #define PIN_SIN_P 26 // ADC 0
 #define PIN_COS_P 27 // ADC 1
 #define PIN_Q0     2 // GPIO
 #define PIN_Q1     3 // GPIO
 
-// ADC conversion factor (3.3V / 4096)
-// Sensor is ratiometric, so VCC fluctuations cancel out if VREF is VCC
+// TMAG5170 Pins (3D Sensor)
+#define SPI_PORT spi0
+#define PIN_MISO 4
+#define PIN_CS   5
+#define PIN_SCK  6
+#define PIN_MOSI 7
+
+// ==========================================
+// === Constants & Globals
+// ==========================================
 #define ADC_CENTER 2048.0f 
 
-// Global variables for shared data
+// TMAG5170 Registers [cite: 4940, 4947]
+#define REG_DEVICE_CONFIG   0x00
+#define REG_SENSOR_CONFIG   0x01
+#define REG_X_CH_RESULT     0x09
+#define REG_Y_CH_RESULT     0x0A
+#define REG_Z_CH_RESULT     0x0B
+#define REG_TEST_CONFIG     0x0F
+
+// Range for A1 variant is +/- 50mT [cite: 3622]
+#define TMAG5170_RANGE_MT 50.0f 
+
+// Shared Data
 volatile float global_angle = 0.0f;
-volatile int32_t blink_time = 500000; // 500ms default
+volatile float global_x_mT = 0.0f;
+volatile float global_y_mT = 0.0f;
+volatile float global_z_mT = 0.0f;
 
-// ==================================================
-// === toggle25 thread 
-// ==================================================
-static PT_THREAD (protothread_toggle25(struct pt *pt))
-{
-    PT_BEGIN(pt);
-    static bool LED_state = false;
+// ==========================================
+// === Helper Functions
+// ==========================================
+static inline void cs_select() {
+    asm volatile("nop \n nop \n nop");
+    gpio_put(PIN_CS, 0);
+    asm volatile("nop \n nop \n nop");
+}
+
+static inline void cs_deselect() {
+    asm volatile("nop \n nop \n nop");
+    gpio_put(PIN_CS, 1);
+    asm volatile("nop \n nop \n nop");
+}
+
+// Reads a 16-bit result from a TMAG5170 register
+float read_tmag5170_axis(uint8_t reg_addr) {
+    // 32-bit Frame: [R/W (1)] [Addr (7)] [Data (16)] [CRC/CMD (4)]
+    // Set Read bit (MSB = 1) [cite: 4662]
+    uint8_t tx_buf[4] = {0x80 | reg_addr, 0x00, 0x00, 0x00};
+    uint8_t rx_buf[4];
+
+    cs_select();
+    spi_write_read_blocking(SPI_PORT, tx_buf, rx_buf, 4);
+    cs_deselect();
+
+    // Data is in the middle 16 bits (bytes 1 and 2) [cite: 4735]
+    int16_t raw_data = (int16_t)((rx_buf[1] << 8) | rx_buf[2]);
     
-    gpio_init(LED_PIN);
-    gpio_set_dir(LED_PIN, GPIO_OUT);
-    gpio_put(LED_PIN, true);
-
-    while(1) {
-        LED_state = !LED_state;
-        gpio_put(LED_PIN, LED_state);
-        PT_YIELD_usec(blink_time);
-    }
-    PT_END(pt);
+    // Conversion to mT using Eq 1 [cite: 4531]
+    // B = (Raw / 2^16) * 2 * Range
+    // Since raw_data is signed 16-bit, dividing by 32768.0 covers the 2^16 * 2 factor
+    return ((float)raw_data / 32768.0f) * TMAG5170_RANGE_MT;
 }
 
 // ==================================================
-// === angle calculation thread
+// === Thread: TMAG6180 Angle Sensor
 // ==================================================
-/* Implements the logic from TMAG6180-Q1 Datasheet Page 28 [cite: 909]
-   to extend AMR 180 range to 360 using Hall sensors (Q0/Q1).
-*/
 static PT_THREAD (protothread_angle(struct pt *pt))
 {
     PT_BEGIN(pt);
-
-    // Initialize Hardware
-    adc_init();
+    // Init ADC/GPIO for Angle Sensor
     adc_gpio_init(PIN_SIN_P);
     adc_gpio_init(PIN_COS_P);
-    
-    gpio_init(PIN_Q0);
-    gpio_set_dir(PIN_Q0, GPIO_IN);
-    gpio_init(PIN_Q1);
-    gpio_set_dir(PIN_Q1, GPIO_IN);
+    gpio_init(PIN_Q0); gpio_set_dir(PIN_Q0, GPIO_IN);
+    gpio_init(PIN_Q1); gpio_set_dir(PIN_Q1, GPIO_IN);
 
     static float sin_val, cos_val, measured_angle, abs_angle;
     static uint16_t raw_sin, raw_cos;
     static int q0, q1, q1_q0;
 
     while(1) {
-        // 1. Read Analog Values (Single-Ended Mode)
-        adc_select_input(0); // SIN_P
-        raw_sin = adc_read();
+        // Read Analog
+        adc_select_input(0); raw_sin = adc_read();
+        adc_select_input(1); raw_cos = adc_read();
         
-        adc_select_input(1); // COS_P
-        raw_cos = adc_read();
-
-        // Remove DC Offset (Vcc/2) [cite: 436]
+        // Remove DC Offset
         sin_val = (float)raw_sin - ADC_CENTER;
         cos_val = (float)raw_cos - ADC_CENTER;
 
-        // 2. Calculate Basic Angle (0-180 range logic)
-        // Formula: theta = atan2(Vsin/Vcos) / 2 [cite: 355]
-        // Note: atan2f returns radians (-PI to PI). 
+        // Calculate Basic Angle
         float angle_rad = atan2f(sin_val, cos_val);
-        
-        // Convert to degrees and divide by 2 per datasheet eq (1)
         float angle_deg_raw = (angle_rad * 180.0f / M_PI) / 2.0f; 
-
-        // Datasheet Step: "If arctan2 function returns from -90deg to 90deg...
-        // convert to 0-180 angle range" [cite: 915]
         measured_angle = 90.0f - angle_deg_raw; 
 
-        // 3. Read Quadrant Bits
+        // Read Quadrant
         q0 = gpio_get(PIN_Q0);
         q1 = gpio_get(PIN_Q1);
-        q1_q0 = (q1 << 1) | q0; // Combine into 2-bit integer (00, 01, 10, 11)
+        q1_q0 = (q1 << 1) | q0;
 
-        // 4. Extend to 360 Degrees
-        // Logic copied directly from Datasheet Page 28 [cite: 916-941]
-        
+        // Extend to 360 Logic [cite: 916-941]
         if (measured_angle > 45.0f && measured_angle < 135.0f) {
-            if (q1_q0 == 0b00 || q1_q0 == 0b10) { // around 90 deg
-                abs_angle = measured_angle;
-            } else { // q1_q0 is 11 or 01, around 270 deg
-                abs_angle = measured_angle + 180.0f;
-            }
-        } 
-        else { // measured_angle is 0-45 or 135-180
-            if (q1_q0 == 0b00 || q1_q0 == 0b01) { // around 0 deg
-                if (measured_angle >= 135.0f) {
-                    abs_angle = measured_angle + 180.0f;
-                } else {
-                    // measured_angle is 0-45
-                    abs_angle = measured_angle;
-                }
-            } 
-            else { // Q1_Q0 is 10 or 11, around 180 deg
-                if (measured_angle >= 135.0f) {
-                    abs_angle = measured_angle;
-                } else {
-                    // measured_angle is 0-45
-                    abs_angle = measured_angle + 180.0f;
-                }
+            if (q1_q0 == 0b00 || q1_q0 == 0b10) abs_angle = measured_angle;
+            else abs_angle = measured_angle + 180.0f;
+        } else { 
+            if (q1_q0 == 0b00 || q1_q0 == 0b01) { 
+                if (measured_angle >= 135.0f) abs_angle = measured_angle + 180.0f;
+                else abs_angle = measured_angle;
+            } else { 
+                if (measured_angle >= 135.0f) abs_angle = measured_angle;
+                else abs_angle = measured_angle + 180.0f;
             }
         }
-
-        // Update global variable for the serial thread
         global_angle = abs_angle;
-
-        // Yield for 10ms (approx 100Hz update rate)
-        PT_YIELD_usec(10000);
+        PT_YIELD_usec(10000); // 10ms yield
     }
     PT_END(pt);
 }
 
 // ==================================================
-// === serial output thread
+// === Thread: TMAG5170 3D Sensor
+// ==================================================
+static PT_THREAD (protothread_tmag5170(struct pt *pt))
+{
+    PT_BEGIN(pt);
+
+    // 1. Initialize SPI
+    spi_init(SPI_PORT, 1000 * 1000); // 1 MHz
+    spi_set_format(SPI_PORT, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
+    
+    gpio_set_function(PIN_MISO, GPIO_FUNC_SPI);
+    gpio_set_function(PIN_SCK, GPIO_FUNC_SPI);
+    gpio_set_function(PIN_MOSI, GPIO_FUNC_SPI);
+    
+    gpio_init(PIN_CS);
+    gpio_set_dir(PIN_CS, GPIO_OUT);
+    cs_deselect();
+
+    // 2. Configure TMAG5170
+    // Step A: Disable CRC for simple 32-bit reads [cite: 5109]
+    // Write 0x0004 to Register 0x0F (TEST_CONFIG)
+    uint8_t disable_crc[4] = {0x0F, 0x00, 0x04, 0x00};
+    cs_select();
+    spi_write_blocking(SPI_PORT, disable_crc, 4);
+    cs_deselect();
+    
+    // Step B: Enable X, Y, Z Channels [cite: 4983]
+    // Write 0x01C0 to Register 0x01 (SENSOR_CONFIG). 
+    // Bits 9-6 (MAG_CH_EN) = 0111 (X, Y, Z on)
+    uint8_t enable_xyz[4] = {0x01, 0x01, 0xC0, 0x00};
+    cs_select();
+    spi_write_blocking(SPI_PORT, enable_xyz, 4);
+    cs_deselect();
+
+    // Step C: Set Continuous Measure Mode [cite: 4971]
+    // Write 0x0020 to Register 0x00 (DEVICE_CONFIG)
+    // Bits 6-4 (OPERATING_MODE) = 010 (Active Measure)
+    uint8_t set_active[4] = {0x00, 0x00, 0x20, 0x00};
+    cs_select();
+    spi_write_blocking(SPI_PORT, set_active, 4);
+    cs_deselect();
+
+    sleep_ms(5); // Allow start-up time
+
+    while(1) {
+        // Read X Axis (0x09)
+        global_x_mT = read_tmag5170_axis(REG_X_CH_RESULT);
+        
+        // Read Y Axis (0x0A)
+        global_y_mT = read_tmag5170_axis(REG_Y_CH_RESULT);
+        
+        // Read Z Axis (0x0B)
+        global_z_mT = read_tmag5170_axis(REG_Z_CH_RESULT);
+
+        PT_YIELD_usec(20000); // 20ms yield (50Hz update)
+    }
+    PT_END(pt);
+}
+
+// ==================================================
+// === Serial Output Thread
 // ==================================================
 static PT_THREAD (protothread_serial(struct pt *pt))
 {
     PT_BEGIN(pt);  
     while(1) {
-         // Print the calculated angle continuously
-         // \033[2J\033[H clears terminal on some VT100 clients
-         sprintf(pt_serial_out_buffer, "Angle: %.2f deg\r\n", global_angle);
+         // Clear screen
+         printf("\033[2J\033[H"); 
          
-         // Non-blocking write
-         serial_write; 
+         printf("=== Sensor Data ===\r\n");
+         printf("Angle (TMAG6180): %.2f deg\r\n", global_angle);
+         printf("3D Field (TMAG5170):\r\n");
+         printf("  X: %.2f mT\r\n", global_x_mT);
+         printf("  Y: %.2f mT\r\n", global_y_mT);
+         printf("  Z: %.2f mT\r\n", global_z_mT);
          
-         // Update terminal approx every 100ms
-         PT_YIELD_usec(100000);
+         PT_YIELD_usec(100000); // Update display every 100ms
     } 
     PT_END(pt);
 }
 
+// ==================================================
+// === Toggle Thread (Heartbeat)
+// ==================================================
+static PT_THREAD (protothread_toggle25(struct pt *pt))
+{
+    PT_BEGIN(pt);
+    gpio_init(LED_PIN);
+    gpio_set_dir(LED_PIN, GPIO_OUT);
+    while(1) {
+        gpio_put(LED_PIN, !gpio_get(LED_PIN));
+        PT_YIELD_usec(500000);
+    }
+    PT_END(pt);
+}
+
 // ========================================
-// === core 0 main
+// === Main
 // ========================================
 int main(){
-  sleep_ms(10);
-  //===  start the serial i/o ==================
   stdio_init_all();
-  printf("\n\rTMAG6180-Q1 Angle Sensor Demo\n\r");
+  adc_init(); // Init ADC peripheral once
+  
+  // Wait for serial connection
+  sleep_ms(2000);
+  printf("\n\rStarting Sensor Demo...\n\r");
 
-  // === config threads ========================
+  // Add threads
   pt_add_thread(protothread_toggle25);
-  pt_add_thread(protothread_angle);   // Added Angle Thread
+  pt_add_thread(protothread_angle);     // Thread for TMAG6180
+  pt_add_thread(protothread_tmag5170);  // Thread for TMAG5170
   pt_add_thread(protothread_serial);
   
-  // === initialize the scheduler =============
   pt_sched_method = SCHED_ROUND_ROBIN;
   pt_schedule_start;
 }

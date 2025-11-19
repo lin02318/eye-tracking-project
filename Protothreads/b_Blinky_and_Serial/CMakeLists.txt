@@ -38,7 +38,8 @@ target_link_libraries(pt_blinky_serial
     hardware_sync
     hardware_clocks
     hardware_vreg
-    hardware_clocks
+    hardware_adc
+    hardware_spi
     )
 
 # if (PICO_CYW43_SUPPORTED)
