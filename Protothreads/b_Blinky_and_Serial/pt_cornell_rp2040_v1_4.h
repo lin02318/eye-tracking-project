@@ -55,6 +55,8 @@
 #ifndef __PT_H__
 #define __PT_H__
 
+#include <string.h>
+
 ////////////////////////
 //#include "lc.h"
 ////////////////////////

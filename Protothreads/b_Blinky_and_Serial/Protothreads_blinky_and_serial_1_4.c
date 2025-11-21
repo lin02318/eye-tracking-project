@@ -18,17 +18,17 @@
 #define LED_PIN 25
 
 // TMAG6180-Q1 Pins (Angle Sensor)
-#define PIN_SIN_P 26 // ADC 0
-#define PIN_COS_P 27 // ADC 1
-#define PIN_Q0     2 // GPIO
-#define PIN_Q1     3 // GPIO
+#define PIN_SIN_P 26 // ADC 0 -> [Pin 31]
+#define PIN_COS_P 27 // ADC 1 -> [Pin 32]
+#define PIN_Q0     2 // GPIO  -> [Pin 4]
+#define PIN_Q1     3 // GPIO  -> [Pin 5]
 
 // TMAG5170 Pins (3D Sensor)
 #define SPI_PORT spi0
-#define PIN_MISO 4
-#define PIN_CS   5
-#define PIN_SCK  6
-#define PIN_MOSI 7
+#define PIN_MISO 4 // GPIO  -> [Pin 6]
+#define PIN_CS   5 // GPIO  -> [Pin 7]
+#define PIN_SCK  6 // GPIO  -> [Pin 9]
+#define PIN_MOSI 7 // GPIO  -> [Pin 10]
 
 // ==========================================
 // === Constants & Globals
@@ -51,6 +51,13 @@ volatile float global_angle = 0.0f;
 volatile float global_x_mT = 0.0f;
 volatile float global_y_mT = 0.0f;
 volatile float global_z_mT = 0.0f;
+
+// Test Data
+volatile float test_angle = 0.0f;
+volatile float sin_test = 0.0f;
+volatile float cos_test = 0.0f;
+volatile int q0_test = 0;
+volatile int q1_test = 0;
 
 // ==========================================
 // === Helper Functions
@@ -101,7 +108,7 @@ static PT_THREAD (protothread_angle(struct pt *pt))
 
     static float sin_val, cos_val, measured_angle, abs_angle;
     static uint16_t raw_sin, raw_cos;
-    static int q0, q1, q1_q0;
+    static int q0, q1, q0_q1;
 
     while(1) {
         // Read Analog
@@ -111,29 +118,31 @@ static PT_THREAD (protothread_angle(struct pt *pt))
         // Remove DC Offset
         sin_val = (float)raw_sin - ADC_CENTER;
         cos_val = (float)raw_cos - ADC_CENTER;
+        sin_test = sin_val;
+        cos_test = cos_val;
 
         // Calculate Basic Angle
         float angle_rad = atan2f(sin_val, cos_val);
-        float angle_deg_raw = (angle_rad * 180.0f / M_PI) / 2.0f; 
-        measured_angle = 90.0f - angle_deg_raw; 
+        float angle_deg_raw = (angle_rad * 180.0f / M_PI);
+        measured_angle = angle_deg_raw / 2.0f; 
+        test_angle = measured_angle;
 
         // Read Quadrant
         q0 = gpio_get(PIN_Q0);
         q1 = gpio_get(PIN_Q1);
-        q1_q0 = (q1 << 1) | q0;
+        q0_q1 = (q0 << 1) | q1;
+        q0_test = q0;
+        q1_test = q1;
 
         // Extend to 360 Logic [cite: 916-941]
-        if (measured_angle > 45.0f && measured_angle < 135.0f) {
-            if (q1_q0 == 0b00 || q1_q0 == 0b10) abs_angle = measured_angle;
-            else abs_angle = measured_angle + 180.0f;
-        } else { 
-            if (q1_q0 == 0b00 || q1_q0 == 0b01) { 
-                if (measured_angle >= 135.0f) abs_angle = measured_angle + 180.0f;
-                else abs_angle = measured_angle;
-            } else { 
-                if (measured_angle >= 135.0f) abs_angle = measured_angle;
-                else abs_angle = measured_angle + 180.0f;
-            }
+        if (q0_q1 == 0b00) {
+            abs_angle = measured_angle;
+        } else if (q0_q1 == 0b01) {
+            abs_angle = measured_angle + 180.0f;
+        } else if (q0_q1 == 0b11) {
+            abs_angle = measured_angle + 180.0f;
+        } else if (q0_q1 == 0b10) {
+            abs_angle = measured_angle + 360.0f;
         }
         global_angle = abs_angle;
         PT_YIELD_usec(10000); // 10ms yield
@@ -213,6 +222,11 @@ static PT_THREAD (protothread_serial(struct pt *pt))
          
          printf("=== Sensor Data ===\r\n");
          printf("Angle (TMAG6180): %.2f deg\r\n", global_angle);
+         printf("Test sin: %.2f\r\n", sin_test);
+         printf("Test cos: %.2f\r\n", cos_test);
+         printf("Test Q0: %d\r\n", q0_test);
+         printf("Test Q1: %d\r\n", q1_test);
+         printf("Test angle: %.2f deg\r\n", test_angle);
          printf("3D Field (TMAG5170):\r\n");
          printf("  X: %.2f mT\r\n", global_x_mT);
          printf("  Y: %.2f mT\r\n", global_y_mT);
