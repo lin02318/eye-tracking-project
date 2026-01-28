@@ -54,6 +54,9 @@ volatile float global_z_mT = 0.0f;
 
 // Test Data
 volatile float test_angle = 0.0f;
+volatile float test_angle_alt = 0.0f;
+volatile float test_angle_alt_prev = 0.0f;
+static int alt_sel = 2;
 volatile float sin_test = 0.0f;
 volatile float cos_test = 0.0f;
 volatile int q0_test = 0;
@@ -76,8 +79,6 @@ static inline void cs_deselect() {
 
 // Reads a 16-bit result from a TMAG5170 register
 float read_tmag5170_axis(uint8_t reg_addr) {
-    // 32-bit Frame: [R/W (1)] [Addr (7)] [Data (16)] [CRC/CMD (4)]
-    // Set Read bit (MSB = 1) [cite: 4662]
     uint8_t tx_buf[4] = {0x80 | reg_addr, 0x00, 0x00, 0x00};
     uint8_t rx_buf[4];
 
@@ -85,12 +86,9 @@ float read_tmag5170_axis(uint8_t reg_addr) {
     spi_write_read_blocking(SPI_PORT, tx_buf, rx_buf, 4);
     cs_deselect();
 
-    // Data is in the middle 16 bits (bytes 1 and 2) [cite: 4735]
     int16_t raw_data = (int16_t)((rx_buf[1] << 8) | rx_buf[2]);
     
-    // Conversion to mT using Eq 1 [cite: 4531]
-    // B = (Raw / 2^16) * 2 * Range
-    // Since raw_data is signed 16-bit, dividing by 32768.0 covers the 2^16 * 2 factor
+    // Conversion to mT
     return ((float)raw_data / 32768.0f) * TMAG5170_RANGE_MT;
 }
 
@@ -109,6 +107,10 @@ static PT_THREAD (protothread_angle(struct pt *pt))
     static float sin_val, cos_val, measured_angle, abs_angle;
     static uint16_t raw_sin, raw_cos;
     static int q0, q1, q0_q1;
+    static int q0_q1_prev = 0;
+
+    static float alt_angle_1, alt_angle_2, alt_angle_3;
+    static float diff_1, diff_2, diff_3;
 
     while(1) {
         // Read Analog
@@ -123,8 +125,8 @@ static PT_THREAD (protothread_angle(struct pt *pt))
 
         // Calculate Basic Angle
         float angle_rad = atan2f(sin_val, cos_val);
-        float angle_deg_raw = (angle_rad * 180.0f / M_PI);
-        measured_angle = angle_deg_raw / 2.0f; 
+        float angle_deg_raw = (angle_rad * 180.0f / M_PI);  // Range -180 ~ 180
+        measured_angle = angle_deg_raw / 2.0f;              // Range -90 ~ 90
         test_angle = measured_angle;
 
         // Read Quadrant
@@ -145,7 +147,38 @@ static PT_THREAD (protothread_angle(struct pt *pt))
             abs_angle = measured_angle + 360.0f;
         }
         global_angle = abs_angle;
-        PT_YIELD_usec(10000); // 10ms yield
+
+        // angle calculation (alternative approach)
+        alt_angle_1 = measured_angle + 90.0f;
+        alt_angle_2 = measured_angle + 270.0f;
+        alt_angle_3 = measured_angle + 450.0f;
+
+        if (q0_q1 != q0_q1_prev) {
+            diff_1 = alt_angle_1 - test_angle_alt;
+            diff_2 = alt_angle_2 - test_angle_alt;
+            diff_3 = alt_angle_3 - test_angle_alt;
+
+            int min_diff = 1;
+            if ( diff_2 < diff_1 ) {
+                min_diff = 2;
+            }
+            if ( (diff_3 < diff_1) && (diff_3 < diff_2) ) {
+                min_diff = 3;
+            }
+
+            alt_sel = min_diff;
+        }
+
+        q0_q1_prev = q0_q1;
+
+        if ( alt_sel == 1 ) {
+            test_angle_alt = alt_angle_1;
+        } else if ( alt_sel == 2 ) {
+            test_angle_alt = alt_angle_2;
+        } else {
+            test_angle_alt = alt_angle_3;
+        }
+        PT_YIELD_usec(20000); // 20ms yield (50Hz update)
     }
     PT_END(pt);
 }
@@ -169,25 +202,20 @@ static PT_THREAD (protothread_tmag5170(struct pt *pt))
     gpio_set_dir(PIN_CS, GPIO_OUT);
     cs_deselect();
 
-    // 2. Configure TMAG5170
-    // Step A: Disable CRC for simple 32-bit reads [cite: 5109]
-    // Write 0x0004 to Register 0x0F (TEST_CONFIG)
+    // Configure TMAG5170
+    // Disable CRC
     uint8_t disable_crc[4] = {0x0F, 0x00, 0x04, 0x00};
     cs_select();
     spi_write_blocking(SPI_PORT, disable_crc, 4);
     cs_deselect();
     
-    // Step B: Enable X, Y, Z Channels [cite: 4983]
-    // Write 0x01C0 to Register 0x01 (SENSOR_CONFIG). 
-    // Bits 9-6 (MAG_CH_EN) = 0111 (X, Y, Z on)
+    // Enable X, Y, Z Channels
     uint8_t enable_xyz[4] = {0x01, 0x01, 0xC0, 0x00};
     cs_select();
     spi_write_blocking(SPI_PORT, enable_xyz, 4);
     cs_deselect();
 
-    // Step C: Set Continuous Measure Mode [cite: 4971]
-    // Write 0x0020 to Register 0x00 (DEVICE_CONFIG)
-    // Bits 6-4 (OPERATING_MODE) = 010 (Active Measure)
+    // Set Continuous Measure Mode
     uint8_t set_active[4] = {0x00, 0x00, 0x20, 0x00};
     cs_select();
     spi_write_blocking(SPI_PORT, set_active, 4);
@@ -227,6 +255,8 @@ static PT_THREAD (protothread_serial(struct pt *pt))
          printf("Test Q0: %d\r\n", q0_test);
          printf("Test Q1: %d\r\n", q1_test);
          printf("Test angle: %.2f deg\r\n", test_angle);
+         printf("Test angle alt: %.2f deg\r\n", test_angle_alt);
+         printf("alt_sel: %d\r\n", alt_sel);
          printf("3D Field (TMAG5170):\r\n");
          printf("  X: %.2f mT\r\n", global_x_mT);
          printf("  Y: %.2f mT\r\n", global_y_mT);
