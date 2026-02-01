@@ -9,6 +9,7 @@
 #include "hardware/spi.h" // Added for TMAG5170
 #include "pico/stdlib.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <math.h>
 #include "pt_cornell_rp2040_v1_4.h"
 
@@ -54,6 +55,10 @@ volatile float global_z_mT = 0.0f;
 
 // Test Data
 volatile float test_angle = 0.0f;
+volatile float test_angle_alt_test;
+volatile float alt_angle_1, alt_angle_2;
+volatile float alt_angle_1_test, alt_angle_2_test;
+volatile float diff_1, diff_2;
 volatile float test_angle_alt = 0.0f;
 volatile float test_angle_alt_prev = 0.0f;
 static int alt_sel = 2;
@@ -109,9 +114,6 @@ static PT_THREAD (protothread_angle(struct pt *pt))
     static int q0, q1, q0_q1;
     static int q0_q1_prev = 0;
 
-    static float alt_angle_1, alt_angle_2, alt_angle_3;
-    static float diff_1, diff_2, diff_3;
-
     while(1) {
         // Read Analog
         adc_select_input(0); raw_sin = adc_read();
@@ -149,21 +151,20 @@ static PT_THREAD (protothread_angle(struct pt *pt))
         global_angle = abs_angle;
 
         // angle calculation (alternative approach)
-        alt_angle_1 = measured_angle + 90.0f;
-        alt_angle_2 = measured_angle + 270.0f;
-        alt_angle_3 = measured_angle + 450.0f;
+        alt_angle_1 = measured_angle - 90.0f;
+        alt_angle_2 = measured_angle + 90.0f;
+        alt_angle_1_test = alt_angle_1;
+        alt_angle_2_test = alt_angle_2;
+        if ( alt_angle_1 < -90.0 ) { alt_angle_1_test = -alt_angle_1 -180.0; }
+        if ( alt_angle_2 > 90.0 ) { alt_angle_2_test = -alt_angle_2 + 180.0; }
 
-        if (q0_q1 != q0_q1_prev) {
-            diff_1 = alt_angle_1 - test_angle_alt;
-            diff_2 = alt_angle_2 - test_angle_alt;
-            diff_3 = alt_angle_3 - test_angle_alt;
+        if ( true ) {
+            diff_1 = abs(alt_angle_1 - test_angle_alt);
+            diff_2 = abs(alt_angle_2 - test_angle_alt);
 
             int min_diff = 1;
             if ( diff_2 < diff_1 ) {
                 min_diff = 2;
-            }
-            if ( (diff_3 < diff_1) && (diff_3 < diff_2) ) {
-                min_diff = 3;
             }
 
             alt_sel = min_diff;
@@ -175,8 +176,6 @@ static PT_THREAD (protothread_angle(struct pt *pt))
             test_angle_alt = alt_angle_1;
         } else if ( alt_sel == 2 ) {
             test_angle_alt = alt_angle_2;
-        } else {
-            test_angle_alt = alt_angle_3;
         }
         PT_YIELD_usec(20000); // 20ms yield (50Hz update)
     }
@@ -256,6 +255,10 @@ static PT_THREAD (protothread_serial(struct pt *pt))
          printf("Test Q1: %d\r\n", q1_test);
          printf("Test angle: %.2f deg\r\n", test_angle);
          printf("Test angle alt: %.2f deg\r\n", test_angle_alt);
+         printf("Test angle alt 1: %.2f deg\r\n", alt_angle_1);
+         printf("Test angle alt 2: %.2f deg\r\n", alt_angle_2);
+         printf("Test angle diff 1: %.2f deg\r\n", diff_1);
+         printf("Test angle diff 2: %.2f deg\r\n", diff_2);
          printf("alt_sel: %d\r\n", alt_sel);
          printf("3D Field (TMAG5170):\r\n");
          printf("  X: %.2f mT\r\n", global_x_mT);
