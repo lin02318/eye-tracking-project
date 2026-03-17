@@ -116,6 +116,11 @@ static PT_THREAD (protothread_sensors(struct pt *pt))
         float y_mT = (y_raw / 32768.0f) * 50.0f;
         float z_mT = (z_raw / 32768.0f) * 50.0f;
 
+        float angle_xy_rad = atan2( -y_mT, -x_mT );
+        float angle_xy_deg = angle_xy_rad * (180.0f / (float)M_PI);
+        float angle_xz_rad = atan2( -z_mT, -2*x_mT );
+        float angle_xz_deg = angle_xz_rad * (180.0f / (float)M_PI);
+
         // --- Read TMAG6180 (Analog AMR) ---
         adc_select_input(0);
         uint16_t sin_raw = adc_read();
@@ -129,12 +134,12 @@ static PT_THREAD (protothread_sensors(struct pt *pt))
         // Calculate Angle (AMR sensor gives 2 periods per 360 degree physical rotation)
         float angle_rad = atan2f(v_sin, v_cos) / 2.0f; 
         float angle_deg = angle_rad * (180.0f / (float)M_PI);
-        if (angle_deg < 0) angle_deg += 180.0f; // Normalize to 0-180
+        // if (angle_deg < 0) angle_deg += 180.0f; // Normalize to 0-180
 
         // --- Output (Aligned with Raw Data) ---
         sprintf(pt_serial_out_buffer, 
-            "TMAG5170: X=%7.2f Y=%7.2f Z=%7.2f mT [Raw: %6d, %6d, %6d] | TMAG6180: Angle=%6.2f deg [Raw: S=%4u, C=%4u]\r\n", 
-            x_mT, y_mT, z_mT, x_raw, y_raw, z_raw, angle_deg, sin_raw, cos_raw);
+            "TMAG5170: X=%7.2f Y=%7.2f Z=%7.2f mT angle_xy=%7.2f angle_xz=%7.2f [Raw: %6d, %6d, %6d] | TMAG6180: Angle=%6.2f deg [Raw: S=%4u, C=%4u]\r\n", 
+            x_mT, y_mT, z_mT, angle_xy_deg, angle_xz_deg, x_raw, y_raw, z_raw, angle_deg, sin_raw, cos_raw);
         serial_write; 
 
         PT_YIELD_usec(100000); // Read 10 times a second
