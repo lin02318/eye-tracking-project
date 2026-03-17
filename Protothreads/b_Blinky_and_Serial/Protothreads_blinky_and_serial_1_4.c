@@ -1,307 +1,178 @@
 /*
- Protothreads demo for:
- 1. TMAG6180-Q1 Angle Sensor (ADC/GPIO) - Datasheet SLYS037A
- 2. TMAG5170 3D Hall Sensor (SPI) - Datasheet SBASAF4
-*/
+ Protothreads 1.4 demo code tailored for TMAG5170 (SPI) and TMAG6180 (ADC)
+ TWO threads on ONE core:
+ -- blinky thread: heart-beat LED
+ -- sensor thread: reads SPI and ADC sensors, calculates angle, prints to serial
+ */
 
-#include "hardware/gpio.h"
-#include "hardware/adc.h"
-#include "hardware/spi.h" // Added for TMAG5170
-#include "pico/stdlib.h"
 #include <stdio.h>
-#include <stdlib.h>
 #include <math.h>
+#include "pico/stdlib.h"
+#include "hardware/gpio.h"
+#include "hardware/spi.h"
+#include "hardware/adc.h"
+#include "hardware/timer.h"
 #include "pt_cornell_rp2040_v1_4.h"
 
-// ==========================================
-// === Pin Definitions
-// ==========================================
+// --- Hardware Pins ---
 #define LED_PIN 25
-
-// TMAG6180-Q1 Pins (Angle Sensor)
-#define PIN_SIN_P 26 // ADC 0 -> [Pin 31]
-#define PIN_COS_P 27 // ADC 1 -> [Pin 32]
-#define PIN_Q0     2 // GPIO  -> [Pin 4]
-#define PIN_Q1     3 // GPIO  -> [Pin 5]
-
-// TMAG5170 Pins (3D Sensor)
 #define SPI_PORT spi0
-#define PIN_MISO 4 // GPIO  -> [Pin 6]
-#define PIN_CS   5 // GPIO  -> [Pin 7]
-#define PIN_SCK  6 // GPIO  -> [Pin 9]
-#define PIN_MOSI 7 // GPIO  -> [Pin 10]
+#define PIN_MISO 16  // Pin 21
+#define PIN_CS   17  // Pin 22
+#define PIN_SCK  18  // Pin 24
+#define PIN_MOSI 19  // Pin 25
 
-// ==========================================
-// === Constants & Globals
-// ==========================================
-#define ADC_CENTER 2048.0f 
+#define ADC_SIN_PIN 26  // Pin 31
+#define ADC_COS_PIN 27  // Pin 32
 
-// TMAG5170 Registers [cite: 4940, 4947]
-#define REG_DEVICE_CONFIG   0x00
-#define REG_SENSOR_CONFIG   0x01
-#define REG_X_CH_RESULT     0x09
-#define REG_Y_CH_RESULT     0x0A
-#define REG_Z_CH_RESULT     0x0B
-#define REG_TEST_CONFIG     0x0F
+// --- TMAG5170 Registers ---
+#define TMAG5170_DEVICE_CONFIG 0x00
+#define TMAG5170_SENSOR_CONFIG 0x01
+#define TMAG5170_X_CH_RESULT   0x09
+#define TMAG5170_Y_CH_RESULT   0x0A
+#define TMAG5170_Z_CH_RESULT   0x0B
 
-// Range for A1 variant is +/- 50mT [cite: 3622]
-#define TMAG5170_RANGE_MT 50.0f 
+int32_t blink_time = 500000; // 0.5s heartbeat
 
-// Shared Data
-volatile float global_angle = 0.0f;
-volatile float global_x_mT = 0.0f;
-volatile float global_y_mT = 0.0f;
-volatile float global_z_mT = 0.0f;
+// --- TMAG5170 SPI Helpers ---
+void tmag5170_write_reg(uint8_t reg, uint16_t data) {
+    uint8_t tx[4];
+    // Bits 31:28 = 0000 (Write), Bits 30:24 = address
+    tx[0] = (reg & 0x7F); 
+    tx[1] = (data >> 8) & 0xFF;
+    tx[2] = data & 0xFF;
+    tx[3] = 0x00; // CMD/CRC padded with 0 since we disable CRC
 
-// Test Data
-volatile float test_angle = 0.0f;
-volatile float test_angle_alt_test;
-volatile float alt_angle_1, alt_angle_2;
-volatile float alt_angle_1_test, alt_angle_2_test;
-volatile float diff_1, diff_2;
-volatile float test_angle_alt = 0.0f;
-volatile float test_angle_alt_prev = 0.0f;
-static int alt_sel = 2;
-volatile float sin_test = 0.0f;
-volatile float cos_test = 0.0f;
-volatile int q0_test = 0;
-volatile int q1_test = 0;
-
-// ==========================================
-// === Helper Functions
-// ==========================================
-static inline void cs_select() {
-    asm volatile("nop \n nop \n nop");
     gpio_put(PIN_CS, 0);
-    asm volatile("nop \n nop \n nop");
-}
-
-static inline void cs_deselect() {
-    asm volatile("nop \n nop \n nop");
+    spi_write_blocking(SPI_PORT, tx, 4);
     gpio_put(PIN_CS, 1);
-    asm volatile("nop \n nop \n nop");
+    sleep_us(10);
 }
 
-// Reads a 16-bit result from a TMAG5170 register
-float read_tmag5170_axis(uint8_t reg_addr) {
-    uint8_t tx_buf[4] = {0x80 | reg_addr, 0x00, 0x00, 0x00};
-    uint8_t rx_buf[4];
-
-    cs_select();
-    spi_write_read_blocking(SPI_PORT, tx_buf, rx_buf, 4);
-    cs_deselect();
-
-    int16_t raw_data = (int16_t)((rx_buf[1] << 8) | rx_buf[2]);
+int16_t tmag5170_read_reg(uint8_t reg) {
+    uint8_t tx[4] = {0};
+    uint8_t rx[4] = {0};
     
-    // Conversion to mT
-    return ((float)raw_data / 32768.0f) * TMAG5170_RANGE_MT;
-}
-
-// ==================================================
-// === Thread: TMAG6180 Angle Sensor
-// ==================================================
-static PT_THREAD (protothread_angle(struct pt *pt))
-{
-    PT_BEGIN(pt);
-    // Init ADC/GPIO for Angle Sensor
-    adc_gpio_init(PIN_SIN_P);
-    adc_gpio_init(PIN_COS_P);
-    gpio_init(PIN_Q0); gpio_set_dir(PIN_Q0, GPIO_IN);
-    gpio_init(PIN_Q1); gpio_set_dir(PIN_Q1, GPIO_IN);
-
-    static float sin_val, cos_val, measured_angle, abs_angle;
-    static uint16_t raw_sin, raw_cos;
-    static int q0, q1, q0_q1;
-    static int q0_q1_prev = 0;
-
-    while(1) {
-        // Read Analog
-        adc_select_input(0); raw_sin = adc_read();
-        adc_select_input(1); raw_cos = adc_read();
-        
-        // Remove DC Offset
-        sin_val = (float)raw_sin - ADC_CENTER;
-        cos_val = (float)raw_cos - ADC_CENTER;
-        sin_test = sin_val;
-        cos_test = cos_val;
-
-        // Calculate Basic Angle
-        float angle_rad = atan2f(sin_val, cos_val);
-        float angle_deg_raw = (angle_rad * 180.0f / M_PI);  // Range -180 ~ 180
-        measured_angle = angle_deg_raw / 2.0f;              // Range -90 ~ 90
-        test_angle = measured_angle;
-
-        // Read Quadrant
-        q0 = gpio_get(PIN_Q0);
-        q1 = gpio_get(PIN_Q1);
-        q0_q1 = (q0 << 1) | q1;
-        q0_test = q0;
-        q1_test = q1;
-
-        // Extend to 360 Logic [cite: 916-941]
-        if (q0_q1 == 0b00) {
-            abs_angle = measured_angle;
-        } else if (q0_q1 == 0b01) {
-            abs_angle = measured_angle + 180.0f;
-        } else if (q0_q1 == 0b11) {
-            abs_angle = measured_angle + 180.0f;
-        } else if (q0_q1 == 0b10) {
-            abs_angle = measured_angle + 360.0f;
-        }
-        global_angle = abs_angle;
-
-        // angle calculation (alternative approach)
-        alt_angle_1 = measured_angle - 90.0f;
-        alt_angle_2 = measured_angle + 90.0f;
-        alt_angle_1_test = alt_angle_1;
-        alt_angle_2_test = alt_angle_2;
-        if ( alt_angle_1 < -90.0 ) { alt_angle_1_test = -alt_angle_1 -180.0; }
-        if ( alt_angle_2 > 90.0 ) { alt_angle_2_test = -alt_angle_2 + 180.0; }
-
-        if ( true ) {
-            diff_1 = abs(alt_angle_1 - test_angle_alt);
-            diff_2 = abs(alt_angle_2 - test_angle_alt);
-
-            int min_diff = 1;
-            if ( diff_2 < diff_1 ) {
-                min_diff = 2;
-            }
-
-            alt_sel = min_diff;
-        }
-
-        q0_q1_prev = q0_q1;
-
-        if ( alt_sel == 1 ) {
-            test_angle_alt = alt_angle_1;
-        } else if ( alt_sel == 2 ) {
-            test_angle_alt = alt_angle_2;
-        }
-        PT_YIELD_usec(20000); // 20ms yield (50Hz update)
-    }
-    PT_END(pt);
-}
-
-// ==================================================
-// === Thread: TMAG5170 3D Sensor
-// ==================================================
-static PT_THREAD (protothread_tmag5170(struct pt *pt))
-{
-    PT_BEGIN(pt);
-
-    // 1. Initialize SPI
-    spi_init(SPI_PORT, 1000 * 1000); // 1 MHz
-    spi_set_format(SPI_PORT, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
+    // Bits 31:28 = 1000 (Read), Bits 30:24 = address
+    tx[0] = 0x80 | (reg & 0x7F); 
     
-    gpio_set_function(PIN_MISO, GPIO_FUNC_SPI);
-    gpio_set_function(PIN_SCK, GPIO_FUNC_SPI);
-    gpio_set_function(PIN_MOSI, GPIO_FUNC_SPI);
-    
-    gpio_init(PIN_CS);
-    gpio_set_dir(PIN_CS, GPIO_OUT);
-    cs_deselect();
+    gpio_put(PIN_CS, 0);
+    spi_write_read_blocking(SPI_PORT, tx, rx, 4);
+    gpio_put(PIN_CS, 1);
+    sleep_us(10);
 
-    // Configure TMAG5170
-    // Disable CRC
-    uint8_t disable_crc[4] = {0x0F, 0x00, 0x04, 0x00};
-    cs_select();
-    spi_write_blocking(SPI_PORT, disable_crc, 4);
-    cs_deselect();
-    
-    // Enable X, Y, Z Channels
-    uint8_t enable_xyz[4] = {0x01, 0x01, 0xC0, 0x00};
-    cs_select();
-    spi_write_blocking(SPI_PORT, enable_xyz, 4);
-    cs_deselect();
+    // The 16-bit result is in bits 23-8 (rx[1] and rx[2])
+    return (int16_t)((rx[1] << 8) | rx[2]);
+}
 
-    // Set Continuous Measure Mode
-    uint8_t set_active[4] = {0x00, 0x00, 0x20, 0x00};
-    cs_select();
-    spi_write_blocking(SPI_PORT, set_active, 4);
-    cs_deselect();
+void tmag5170_init() {
+    // 1. Disable CRC requirement: Send 0x0F000407 
+    uint8_t crc_disable_cmd[4] = {0x0F, 0x00, 0x04, 0x07};
+    gpio_put(PIN_CS, 0);
+    spi_write_blocking(SPI_PORT, crc_disable_cmd, 4);
+    gpio_put(PIN_CS, 1);
+    sleep_ms(1);
 
-    sleep_ms(5); // Allow start-up time
+    // 2. DEVICE_CONFIG: Operating mode = Continuous (bits 6-4 = 010b)
+    tmag5170_write_reg(TMAG5170_DEVICE_CONFIG, 0x0020);
 
-    while(1) {
-        // Read X Axis (0x09)
-        global_x_mT = read_tmag5170_axis(REG_X_CH_RESULT);
-        
-        // Read Y Axis (0x0A)
-        global_y_mT = read_tmag5170_axis(REG_Y_CH_RESULT);
-        
-        // Read Z Axis (0x0B)
-        global_z_mT = read_tmag5170_axis(REG_Z_CH_RESULT);
-
-        PT_YIELD_usec(20000); // 20ms yield (50Hz update)
-    }
-    PT_END(pt);
+    // 3. SENSOR_CONFIG: Enable X, Y, Z channels (bits 9-6 = 0111b)
+    tmag5170_write_reg(TMAG5170_SENSOR_CONFIG, 0x01C0);
 }
 
 // ==================================================
-// === Serial Output Thread
-// ==================================================
-static PT_THREAD (protothread_serial(struct pt *pt))
-{
-    PT_BEGIN(pt);  
-    while(1) {
-         // Clear screen
-         printf("\033[2J\033[H"); 
-         
-         printf("=== Sensor Data ===\r\n");
-         printf("Angle (TMAG6180): %.2f deg\r\n", global_angle);
-         printf("Test sin: %.2f\r\n", sin_test);
-         printf("Test cos: %.2f\r\n", cos_test);
-         printf("Test Q0: %d\r\n", q0_test);
-         printf("Test Q1: %d\r\n", q1_test);
-         printf("Test angle: %.2f deg\r\n", test_angle);
-         printf("Test angle alt: %.2f deg\r\n", test_angle_alt);
-         printf("Test angle alt 1: %.2f deg\r\n", alt_angle_1);
-         printf("Test angle alt 2: %.2f deg\r\n", alt_angle_2);
-         printf("Test angle diff 1: %.2f deg\r\n", diff_1);
-         printf("Test angle diff 2: %.2f deg\r\n", diff_2);
-         printf("alt_sel: %d\r\n", alt_sel);
-         printf("3D Field (TMAG5170):\r\n");
-         printf("  X: %.2f mT\r\n", global_x_mT);
-         printf("  Y: %.2f mT\r\n", global_y_mT);
-         printf("  Z: %.2f mT\r\n", global_z_mT);
-         
-         PT_YIELD_usec(100000); // Update display every 100ms
-    } 
-    PT_END(pt);
-}
-
-// ==================================================
-// === Toggle Thread (Heartbeat)
+// === Blinky Thread
 // ==================================================
 static PT_THREAD (protothread_toggle25(struct pt *pt))
 {
     PT_BEGIN(pt);
-    gpio_init(LED_PIN);
+    static bool LED_state = false;
+    gpio_init(LED_PIN);	
     gpio_set_dir(LED_PIN, GPIO_OUT);
+    gpio_put(LED_PIN, true);
+
     while(1) {
-        gpio_put(LED_PIN, !gpio_get(LED_PIN));
-        PT_YIELD_usec(500000);
+        LED_state = !LED_state;
+        gpio_put(LED_PIN, LED_state);
+        PT_YIELD_usec(blink_time);
     }
     PT_END(pt);
 }
 
+// ==================================================
+// === Sensor Read Thread
+// ==================================================
+static PT_THREAD (protothread_sensors(struct pt *pt))
+{
+    PT_BEGIN(pt);  
+    while(1) {
+        // --- Read TMAG5170 (Digital 3D) ---
+        int16_t x_raw = tmag5170_read_reg(TMAG5170_X_CH_RESULT);
+        int16_t y_raw = tmag5170_read_reg(TMAG5170_Y_CH_RESULT);
+        int16_t z_raw = tmag5170_read_reg(TMAG5170_Z_CH_RESULT);
+
+        // Convert to mT (assuming default 50mT range)
+        float x_mT = (x_raw / 32768.0f) * 50.0f;
+        float y_mT = (y_raw / 32768.0f) * 50.0f;
+        float z_mT = (z_raw / 32768.0f) * 50.0f;
+
+        // --- Read TMAG6180 (Analog AMR) ---
+        adc_select_input(0);
+        uint16_t sin_raw = adc_read();
+        adc_select_input(1);
+        uint16_t cos_raw = adc_read();
+
+        // 12-bit ADC midpoint is ~2048 (representing Vcc/2)
+        float v_sin = (sin_raw - 2048.0f);
+        float v_cos = (cos_raw - 2048.0f);
+
+        // Calculate Angle (AMR sensor gives 2 periods per 360 degree physical rotation)
+        float angle_rad = atan2f(v_sin, v_cos) / 2.0f; 
+        float angle_deg = angle_rad * (180.0f / (float)M_PI);
+        if (angle_deg < 0) angle_deg += 180.0f; // Normalize to 0-180
+
+        // --- Output (Aligned with Raw Data) ---
+        sprintf(pt_serial_out_buffer, 
+            "TMAG5170: X=%7.2f Y=%7.2f Z=%7.2f mT [Raw: %6d, %6d, %6d] | TMAG6180: Angle=%6.2f deg [Raw: S=%4u, C=%4u]\r\n", 
+            x_mT, y_mT, z_mT, x_raw, y_raw, z_raw, angle_deg, sin_raw, cos_raw);
+        serial_write; 
+
+        PT_YIELD_usec(100000); // Read 10 times a second
+    } 
+    PT_END(pt);
+}
+
 // ========================================
-// === Main
+// === Core 0 Main
 // ========================================
 int main(){
-  stdio_init_all();
-  adc_init(); // Init ADC peripheral once
-  
-  // Wait for serial connection
-  sleep_ms(2000);
-  printf("\n\rStarting Sensor Demo...\n\r");
+    sleep_ms(10);
+    stdio_init_all();
+    printf("\n\rStarting TMAG5170 and TMAG6180 Dual-Sensor Read\n\r");
 
-  // Add threads
-  pt_add_thread(protothread_toggle25);
-  pt_add_thread(protothread_angle);     // Thread for TMAG6180
-  pt_add_thread(protothread_tmag5170);  // Thread for TMAG5170
-  pt_add_thread(protothread_serial);
+    // Initialize SPI
+    spi_init(SPI_PORT, 1000 * 1000); // 1 MHz
+    gpio_set_function(PIN_MISO, GPIO_FUNC_SPI);
+    gpio_set_function(PIN_SCK, GPIO_FUNC_SPI);
+    gpio_set_function(PIN_MOSI, GPIO_FUNC_SPI);
+    
+    // Initialize CS pin
+    gpio_init(PIN_CS);
+    gpio_set_dir(PIN_CS, GPIO_OUT);
+    gpio_put(PIN_CS, 1);
+
+    // Initialize TMAG5170
+    tmag5170_init();
+
+    // Initialize ADC
+    adc_init();
+    adc_gpio_init(ADC_SIN_PIN);
+    adc_gpio_init(ADC_COS_PIN);
+
+    // Config threads
+    pt_add_thread(protothread_toggle25);
+    pt_add_thread(protothread_sensors);
   
-  pt_sched_method = SCHED_ROUND_ROBIN;
-  pt_schedule_start;
+    pt_sched_method = SCHED_ROUND_ROBIN;
+    pt_schedule_start;
 }
