@@ -34,6 +34,10 @@
 
 int32_t blink_time = 500000; // 0.5s heartbeat
 
+// --- Global Recording & Timing State ---
+volatile bool is_recording = false;
+volatile bool sample_now = false;   // Our new IRQ flag
+
 // --- TMAG5170 SPI Helpers ---
 void tmag5170_write_reg(uint8_t reg, uint16_t data) {
     uint8_t tx[4];
@@ -76,8 +80,20 @@ void tmag5170_init() {
     // 2. DEVICE_CONFIG: Operating mode = Continuous (bits 6-4 = 010b)
     tmag5170_write_reg(TMAG5170_DEVICE_CONFIG, 0x0020);
 
-    // 3. SENSOR_CONFIG: Enable X, Y, Z channels (bits 9-6 = 0111b)
-    tmag5170_write_reg(TMAG5170_SENSOR_CONFIG, 0x01C0);
+    // 3. SENSOR_CONFIG: XYZ enabled (0x01C0) + Set ranges to +/- 25mT (0x0015)
+    // Resulting value: 0x01D5
+    tmag5170_write_reg(TMAG5170_SENSOR_CONFIG, 0x01D5);
+}
+
+// ==================================================
+// === 100 Hz Hardware Timer Interrupt
+// ==================================================
+bool repeating_timer_callback(struct repeating_timer *t) {
+    // If we are recording, tell the main thread it is time to sample!
+    if (is_recording) {
+        sample_now = true;
+    }
+    return true; // Return true to keep the timer repeating
 }
 
 // ==================================================
@@ -94,55 +110,87 @@ static PT_THREAD (protothread_toggle25(struct pt *pt))
     while(1) {
         LED_state = !LED_state;
         gpio_put(LED_PIN, LED_state);
-        PT_YIELD_usec(blink_time);
+        
+        // Fast blink (50ms) if recording, normal heartbeat (500ms) otherwise
+        if (is_recording) {
+            PT_YIELD_usec(50000); 
+        } else {
+            PT_YIELD_usec(500000); 
+        }
     }
     PT_END(pt);
 }
 
 // ==================================================
-// === Sensor Read Thread
+// === Sensor Read Thread (Hardware 100Hz Paced)
 // ==================================================
 static PT_THREAD (protothread_sensors(struct pt *pt))
 {
-    PT_BEGIN(pt);  
+    PT_BEGIN(pt);
+
+    static uint32_t start_time;
+    static struct repeating_timer timer; // Timer structure
+
     while(1) {
-        // --- Read TMAG5170 (Digital 3D) ---
-        int16_t x_raw = tmag5170_read_reg(TMAG5170_X_CH_RESULT);
-        int16_t y_raw = tmag5170_read_reg(TMAG5170_Y_CH_RESULT);
-        int16_t z_raw = tmag5170_read_reg(TMAG5170_Z_CH_RESULT);
+        // --- 1. Wait for Trigger ---
+        if (!is_recording) {
+            int c;
+            // Drain the buffer and check for 'r'
+            while ((c = getchar_timeout_us(0)) != PICO_ERROR_TIMEOUT) {
+                if (c == 'r' || c == 'R') {
+                    is_recording = true;
+                    start_time = time_us_32();
+                    sample_now = false; // Reset flag just in case
+                    
+                    // START THE TIMER: -10000 us means exactly 10ms from the *start* of the last call
+                    add_repeating_timer_us(-10000, repeating_timer_callback, NULL, &timer);
+                    
+                    // Print header
+                    printf("Time(ms),5170_X,5170_Y,5170_Z,6180_SIN,6180_COS\r\n");
+                }
+            }
+        }
 
-        // Convert to mT (assuming default 50mT range)
-        float x_mT = (x_raw / 32768.0f) * 50.0f;
-        float y_mT = (y_raw / 32768.0f) * 50.0f;
-        float z_mT = (z_raw / 32768.0f) * 50.0f;
+        // --- 2. Record and Stream Data ---
+        if (is_recording) {
+            
+            // === WAIT FOR HARDWARE INTERRUPT ===
+            // The thread pauses here until the 10ms timer fires.
+            // When it wakes up, it resumes exactly on the next line!
+            PT_YIELD_UNTIL(pt, sample_now);
+            sample_now = false; // Acknowledge and clear the flag
 
-        float angle_xy_rad = atan2( -y_mT, -x_mT );
-        float angle_xy_deg = angle_xy_rad * (180.0f / (float)M_PI);
-        float angle_xz_rad = atan2( -z_mT, -2*x_mT );
-        float angle_xz_deg = angle_xz_rad * (180.0f / (float)M_PI);
+            // --- CALCULATE TIME AFTER WAKING UP ---
+            uint32_t current_time = time_us_32();
+            uint32_t elapsed_us = current_time - start_time;
 
-        // --- Read TMAG6180 (Analog AMR) ---
-        adc_select_input(0);
-        uint16_t sin_raw = adc_read();
-        adc_select_input(1);
-        uint16_t cos_raw = adc_read();
+            if (elapsed_us > 5000000) { // 5 Seconds
+                is_recording = false;
+                cancel_repeating_timer(&timer); // STOP THE TIMER
+                printf("DONE\r\n"); 
+            } else {
+                // --- Read TMAG5170 Raw Data ---
+                int16_t x_raw = tmag5170_read_reg(TMAG5170_X_CH_RESULT); 
+                int16_t y_raw = tmag5170_read_reg(TMAG5170_Y_CH_RESULT); 
+                int16_t z_raw = tmag5170_read_reg(TMAG5170_Z_CH_RESULT); 
 
-        // 12-bit ADC midpoint is ~2048 (representing Vcc/2)
-        float v_sin = (sin_raw - 2048.0f);
-        float v_cos = (cos_raw - 2048.0f);
+                // --- Read TMAG6180 Raw Data ---
+                adc_select_input(0);
+                adc_read(); // Dummy read
+                int16_t v_sin_raw = (int16_t)adc_read() - 2048; 
+                
+                adc_select_input(1);
+                adc_read(); // Dummy read
+                int16_t v_cos_raw = (int16_t)adc_read() - 2048;
 
-        // Calculate Angle (AMR sensor gives 2 periods per 360 degree physical rotation)
-        float angle_rad = atan2f(v_sin, v_cos) / 2.0f; 
-        float angle_deg = angle_rad * (180.0f / (float)M_PI);
-        // if (angle_deg < 0) angle_deg += 180.0f; // Normalize to 0-180
-
-        // --- Output (Aligned with Raw Data) ---
-        sprintf(pt_serial_out_buffer, 
-            "TMAG5170: X=%7.2f Y=%7.2f Z=%7.2f mT angle_xy=%7.2f angle_xz=%7.2f [Raw: %6d, %6d, %6d] | TMAG6180: Angle=%6.2f deg [Raw: S=%4u, C=%4u]\r\n", 
-            x_mT, y_mT, z_mT, angle_xy_deg, angle_xz_deg, x_raw, y_raw, z_raw, angle_deg, sin_raw, cos_raw);
-        serial_write; 
-
-        PT_YIELD_usec(100000); // Read 10 times a second
+                // Output raw integers
+                printf("%u,%d,%d,%d,%d,%d\r\n", 
+                    elapsed_us / 1000, x_raw, y_raw, z_raw, v_sin_raw, v_cos_raw);
+            }
+        } else {
+            // Yield briefly while waiting for Python trigger
+            PT_YIELD_usec(50000); 
+        }
     } 
     PT_END(pt);
 }
@@ -157,6 +205,7 @@ int main(){
 
     // Initialize SPI
     spi_init(SPI_PORT, 1000 * 1000); // 1 MHz
+    spi_set_format(SPI_PORT, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
     gpio_set_function(PIN_MISO, GPIO_FUNC_SPI);
     gpio_set_function(PIN_SCK, GPIO_FUNC_SPI);
     gpio_set_function(PIN_MOSI, GPIO_FUNC_SPI);
