@@ -1,5 +1,9 @@
 # Wireless, Magnet-Based Eye Tracking in Lab Animals
 
+Thomas Lin (tal96), Jialin Song (js3885)
+
+Advisor: Professor Hunter Adams (vha3)
+
 ## Introduction
 
 ( summarize the following paragraph in 1-2 sentences )
