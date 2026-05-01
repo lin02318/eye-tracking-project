@@ -30,8 +30,9 @@ To evaluate feasibility, we built a physical eye model and a high-speed data acq
 - A ping-pong ball with an attached surface magnet simulates the animal eye
 - A custom bracket with precise degree markings holds the ball, establishing our ground-truth baseline for measurements.
 
-[ Picture: System Schematic Diagram ]  
-[ Picture: Photos of the RP2040, Sensors, and Ping-Pong ball setup ]
+[ Picture: system schematic ]  
+[ Picture: hardware setup ]
+[ (Optional) other pictures of the sensor ]
 
 ## Results
 
@@ -45,7 +46,7 @@ We recorded measured angles against the ground-truth bracket in 22.5° increment
 #### Initial Findings
 Both sensors exhibited similar baseline accuracy (error generally < 10°).
 
-[ Picture: Angle Accuracy / Error Chart ]
+[ Picture: error angle for both sensors ]
 
 #### The Challenge
 Raw data contained significant noise. Stable readings initially required a heavy digital low-pass filter (sampling at 10 Hz, averaging 50 samples over 5 seconds). Because lab animals exhibit rapid eye movements, heavy low-pass filtering is impractical.
@@ -59,7 +60,7 @@ To determine which sensor is best for live-animal applications, we removed the l
 - TMAG6180 (Analog AMR Angle Sensor): Displayed excellent stability. The peak-to-peak jitter was only ~1°, with an RMS Noise of just ~0.27°.
 - Spectrum Analysis: Fast Fourier Transform (FFT) calculations showed a relatively uniform noise floor across the 0–50 Hz spectrum for both devices.
 
-[ Picture: Angle-Over-Time and Frequency Spectrum Plot for both sensors ]
+[ Picture: noise analysis for both sensors ]
 
 ## Conclusion
 
