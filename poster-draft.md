@@ -40,8 +40,8 @@ To evaluate feasibility, we built a physical eye model and a high-speed data acq
 We recorded measured angles against the ground-truth bracket in 22.5° increments.
 
 #### Calculation Methods
-- TMAG5170:$$\text{Angle} = \text{atan2}(-B_y, -B_x) \times \frac{180}{\pi}$$
-- TMAG6180:$$\text{Angle} = \frac{\text{atan2}(V_{sin}, V_{cos})}{2} \times \frac{180}{\pi}$$(Note: AMR sensors have a 180° measurement range, causing wrap-around).
+- TMAG5170:$$\text{angle} = \text{atan2}(-B_y, -B_x) \times \frac{180}{\pi}$$
+- TMAG6180:$$\text{angle} = \frac{\text{atan2}(V_{sin}, V_{cos})}{2} \times \frac{180}{\pi}$$(Note: AMR sensors have a 180° measurement range, causing wrap-around).
 
 #### Initial Findings
 Both sensors exhibited similar baseline accuracy (error generally < 10°).
